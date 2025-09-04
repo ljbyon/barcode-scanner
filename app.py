@@ -9,12 +9,12 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # Render PostgreSQL
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    # SQLAlchemy requires postgresql://
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 engine = create_engine(DATABASE_URL or "sqlite:///scans.db", pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
+
 
 class Scan(Base):
     __tablename__ = "scans"
@@ -23,14 +23,17 @@ class Scan(Base):
     count = Column(Integer, default=1, nullable=False)
     timestamp = Column(DateTime, default=dt.datetime.utcnow, nullable=False)
 
+
 Base.metadata.create_all(bind=engine)
 
 # ───────────────────────── Flask app ─────────────────────────
 app = Flask(__name__)
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 # ───────────────────────── HTML (PWA) ─────────────────────────
 INDEX_HTML = """<!doctype html>
@@ -115,12 +118,12 @@ INDEX_HTML = """<!doctype html>
 
 <script src="https://unpkg.com/@ericblade/quagga2/dist/quagga.js"></script>
 <script>
-// ───────────────────────── PWA registration ─────────────────────────
+/* ───────── PWA registration ───────── */
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/service-worker.js').catch(console.error);
 }
 
-// ───────────────────────── Net status ─────────────────────────
+/* ───────── Net status ───────── */
 const netStatus = document.getElementById('netStatus');
 function updateNet() {
   netStatus.textContent = navigator.onLine ? 'Online' : 'Offline';
@@ -130,166 +133,115 @@ window.addEventListener('online', updateNet);
 window.addEventListener('offline', updateNet);
 updateNet();
 
-// ───────────────────────── IndexedDB minimal helper ─────────────────────────
-const DB_NAME = 'inv_scanner_db';
-const STORE = 'scans'; // individual events {sku, count, ts, synced:false}
-
-function idbOpen() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
-    req.onupgradeneeded = (e) => {
-      const db = e.target.result;
-      if (!db.objectStoreNames.contains(STORE)) {
-        const os = db.createObjectStore(STORE, { keyPath: 'id', autoIncrement: true });
-        os.createIndex('sku', 'sku', { unique: false });
-        os.createIndex('synced', 'synced', { unique: false });
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function idbAddScan(sku, count, ts, synced=false) {
-  const db = await idbOpen();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readwrite');
-    tx.objectStore(STORE).add({ sku, count, ts, synced });
-    tx.oncomplete = () => resolve(true);
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-async function idbGetAll(onlyUnsynced=false) {
-  const db = await idbOpen();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readonly');
-    const store = tx.objectStore(STORE);
-    const req = onlyUnsynced ? store.index('synced').getAll(false) : store.getAll();
-    req.onsuccess = () => resolve(req.result || []);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function idbMarkSynced(ids) {
-  const db = await idbOpen();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readwrite');
-    const store = tx.objectStore(STORE);
-    ids.forEach(id => {
-      const getReq = store.get(id);
-      getReq.onsuccess = () => {
-        const rec = getReq.result;
-        if (rec) {
-          rec.synced = true;
-          store.put(rec);
-        }
-      };
-    });
-    tx.oncomplete = () => resolve(true);
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-async function idbClearUnsynced() {
-  const db = await idbOpen();
-  const all = await idbGetAll(false);
-  const toDelete = all.filter(x => !x.synced).map(x => x.id);
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readwrite');
-    const store = tx.objectStore(STORE);
-    toDelete.forEach(id => store.delete(id));
-    tx.oncomplete = () => resolve(true);
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-// ───────────────────────── UI + Aggregation ─────────────────────────
+/* ───────── UI elems ───────── */
 const lastScan = document.getElementById('lastScan');
 const aggTableBody = document.querySelector('#aggTable tbody');
 const serverTableBody = document.querySelector('#serverTable tbody');
-
-async function refreshLocalAgg() {
-  const all = await idbGetAll(false);
-  // aggregate by SKU (count only unsynced + synced, full local view)
-  const map = new Map();
-  for (const r of all) {
-    const key = r.sku;
-    const prev = map.get(key) || { count: 0, ts: null };
-    prev.count += Number(r.count || 1);
-    prev.ts = prev.ts ? Math.max(prev.ts, r.ts) : r.ts;
-    map.set(key, prev);
-  }
-  aggTableBody.innerHTML = '';
-  [...map.entries()].sort((a,b) => a[0].localeCompare(b[0])).forEach(([sku, info]) => {
-    const tr = document.createElement('tr');
-    const last = new Date(info.ts).toISOString();
-    tr.innerHTML = `<td>${sku}</td><td>${info.count}</td><td>${last}</td>`;
-    aggTableBody.appendChild(tr);
-  });
-}
-
-// ───────────────────────── Quagga2 init ─────────────────────────
 const preview = document.getElementById('preview');
 const cameraSelect = document.getElementById('cameraSelect');
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const flashBtn = document.getElementById('flashBtn');
+const syncStatus = document.getElementById('syncStatus');
+function setSyncStatus(t) { syncStatus.textContent = t; }
+function setLast(msg){ lastScan.textContent = msg; }
 
+/* ───────── IndexedDB ───────── */
+const DB_NAME = 'inv_scanner_db';
+const STORE = 'scans';
+function idbOpen(){ return new Promise((res,rej)=>{ const r = indexedDB.open(DB_NAME,1);
+  r.onupgradeneeded=e=>{ const db=e.target.result; if(!db.objectStoreNames.contains(STORE)){ const os=db.createObjectStore(STORE,{keyPath:'id',autoIncrement:true}); os.createIndex('sku','sku'); os.createIndex('synced','synced'); } };
+  r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); });}
+async function idbAddScan(sku,count,ts,synced=false){ const db=await idbOpen(); return new Promise((res,rej)=>{ const tx=db.transaction(STORE,'readwrite'); tx.objectStore(STORE).add({sku,count,ts,synced}); tx.oncomplete=()=>res(true); tx.onerror=()=>rej(tx.error); });}
+async function idbGetAll(onlyUnsynced=false){ const db=await idbOpen(); return new Promise((res,rej)=>{ const tx=db.transaction(STORE,'readonly'); const st=tx.objectStore(STORE); const req=onlyUnsynced?st.index('synced').getAll(false):st.getAll(); req.onsuccess=()=>res(req.result||[]); req.onerror=()=>rej(req.error); });}
+async function idbMarkSynced(ids){ const db=await idbOpen(); return new Promise((res,rej)=>{ const tx=db.transaction(STORE,'readwrite'); const st=tx.objectStore(STORE);
+  ids.forEach(id=>{ const g=st.get(id); g.onsuccess=()=>{ const rec=g.result; if(rec){ rec.synced=true; st.put(rec);} };});
+  tx.oncomplete=()=>res(true); tx.onerror=()=>rej(tx.error); });}
+async function idbClearUnsynced(){ const db=await idbOpen(); const all=await idbGetAll(false); const del=all.filter(x=>!x.synced).map(x=>x.id);
+  return new Promise((res,rej)=>{ const tx=db.transaction(STORE,'readwrite'); const st=tx.objectStore(STORE); del.forEach(id=>st.delete(id)); tx.oncomplete=()=>res(true); tx.onerror=()=>rej(tx.error); });}
+
+/* ───────── Local aggregation ───────── */
+async function refreshLocalAgg(){
+  const all = await idbGetAll(false);
+  const map = new Map();
+  for (const r of all){ const k=r.sku; const prev=map.get(k)||{count:0,ts:null}; prev.count+=Number(r.count||1); prev.ts = prev.ts?Math.max(prev.ts, r.ts):r.ts; map.set(k,prev); }
+  aggTableBody.innerHTML='';
+  [...map.entries()].sort((a,b)=>a[0].localeCompare(b[0])).forEach(([sku,info])=>{
+    const tr=document.createElement('tr'); tr.innerHTML=`<td>${sku}</td><td>${info.count}</td><td>${new Date(info.ts).toISOString()}</td>`; aggTableBody.appendChild(tr);});
+}
+
+/* ───────── Camera management ───────── */
 let quaggaRunning = false;
 let currentStreamTrack = null;
+let plainStream = null;
 
-async function listCameras() {
+async function ensurePermissionAndDeviceList() {
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    s.getTracks().forEach(t=>t.stop());
+  } catch (e) {
+    setLast('Camera permission denied. Enable camera in site settings.');
+  }
   const devs = await navigator.mediaDevices.enumerateDevices();
-  const vids = devs.filter(d => d.kind === 'videoinput');
-  cameraSelect.innerHTML = '';
-  vids.forEach((d, i) => {
-    const opt = document.createElement('option');
-    opt.value = d.deviceId;
-    opt.textContent = d.label || `Camera ${i+1}`;
+  const vids = devs.filter(d=>d.kind==='videoinput');
+  cameraSelect.innerHTML='';
+  vids.forEach((d,i)=>{
+    const opt=document.createElement('option');
+    opt.value=d.deviceId;
+    opt.textContent=d.label || `Camera ${i+1}`;
     cameraSelect.appendChild(opt);
   });
+  const back = vids.find(v => /back|environment/i.test(v.label||''));
+  if (back) cameraSelect.value = back.deviceId;
 }
 
 async function startScanner() {
-  await listCameras();
+  stopScanner(); // clean previous
+  await ensurePermissionAndDeviceList();
+
   const deviceId = cameraSelect.value || undefined;
-  const constraints = {
-    width: { ideal: 1280 },
-    height: { ideal: 720 },
-    facingMode: 'environment'
-  };
-  if (deviceId) constraints.deviceId = { exact: deviceId };
+  const constraints = deviceId
+    ? { video: { deviceId: { exact: deviceId } }, audio: false }
+    : { video: { facingMode: { ideal: 'environment' } }, audio: false };
+
+  // Plain preview first (so you can see camera even if Quagga fails)
+  try {
+    plainStream = await navigator.mediaDevices.getUserMedia(constraints);
+    preview.srcObject = plainStream;
+    await preview.play();
+  } catch (e) {
+    console.error(e);
+    setLast('Could not open camera (permission or another app is using it).');
+    return;
+  }
+
+  const qConstraints = { ...constraints.video, width: { ideal: 1280 }, height: { ideal: 720 } };
 
   Quagga.init({
     inputStream: {
       type: "LiveStream",
       target: preview,
-      constraints
+      constraints: qConstraints
     },
     decoder: {
       readers: [
-        "code_128_reader",
-        "ean_reader",
-        "ean_8_reader",
-        "upc_reader",
-        "upc_e_reader",
-        "code_39_reader",
-        "code_39_vin_reader",
-        "codabar_reader",
-        "i2of5_reader",
-        "2of5_reader",
-        "code_93_reader"
+        "code_128_reader","ean_reader","ean_8_reader","upc_reader","upc_e_reader",
+        "code_39_reader","code_39_vin_reader","codabar_reader","i2of5_reader","2of5_reader","code_93_reader"
       ]
     },
-    locate: true
+    locate: true,
+    numOfWorkers: 0,            // mobile quirk
+    locator: { patchSize: "medium", halfSample: true }
   }, (err) => {
-    if (err) { console.error(err); return; }
+    if (err) {
+      console.error(err);
+      setLast('Scanner init failed. Using camera preview only.');
+      return;
+    }
     Quagga.start();
     quaggaRunning = true;
-    // keep track of track to toggle torch
-    const tracks = Quagga.cameraAccess.getActiveTrack();
-    currentStreamTrack = tracks;
+    try { currentStreamTrack = Quagga.cameraAccess.getActiveTrack(); } catch(_) {}
+    setLast('Scanner started. Point a barcode at the camera.');
   });
 
   Quagga.onDetected(async (data) => {
@@ -300,21 +252,22 @@ async function startScanner() {
 }
 
 function stopScanner() {
-  Quagga.stop();
+  try { Quagga.stop(); } catch(_) {}
   quaggaRunning = false;
   currentStreamTrack = null;
+  if (plainStream) { plainStream.getTracks().forEach(t=>t.stop()); plainStream=null; }
+  preview.srcObject = null;
 }
 
-// Torch toggle (if supported)
 function toggleTorch() {
   try {
-    const track = currentStreamTrack;
-    if (track && track.applyConstraints) {
-      const caps = track.getCapabilities?.() || {};
+    const track = currentStreamTrack || (preview.srcObject && preview.srcObject.getVideoTracks()[0]);
+    if (track && track.getCapabilities) {
+      const caps = track.getCapabilities();
       if (caps.torch) {
         const cur = track.getConstraints();
-        const desired = { advanced: [{ torch: !(cur.advanced?.[0]?.torch) }] };
-        track.applyConstraints(desired);
+        const torchOn = !!(cur.advanced && cur.advanced[0] && cur.advanced[0].torch);
+        track.applyConstraints({ advanced: [{ torch: !torchOn }] });
       }
     }
   } catch(e) { console.debug('Torch unsupported', e); }
@@ -324,7 +277,7 @@ startBtn.onclick = startScanner;
 stopBtn.onclick = stopScanner;
 flashBtn.onclick = toggleTorch;
 
-// Manual add
+/* ───────── Manual add ───────── */
 document.getElementById('addManual').onclick = async () => {
   const v = document.getElementById('manualSku').value.trim();
   if (!v) return;
@@ -332,49 +285,30 @@ document.getElementById('addManual').onclick = async () => {
   document.getElementById('manualSku').value = '';
 };
 
-// ───────────────────────── Recording & Sync ─────────────────────────
-const syncStatus = document.getElementById('syncStatus');
-function setSyncStatus(t) { syncStatus.textContent = t; }
-
+/* ───────── Sync logic ───────── */
 async function recordScan(sku) {
   const ts = new Date().toISOString();
   await idbAddScan(sku, 1, ts, false);
-  lastScan.textContent = `Last scan: ${sku} @ ${ts}`;
+  setLast(`Last scan: ${sku} @ ${ts}`);
   refreshLocalAgg();
-  // try background sync if online
-  if (navigator.onLine) {
-    await trySync();
-  }
+  if (navigator.onLine) await trySync();
 }
 
 async function trySync() {
-  // Attempt Background Sync if available
   if ('serviceWorker' in navigator && 'SyncManager' in window) {
     const reg = await navigator.serviceWorker.ready;
-    try {
-      await reg.sync.register('sync-scans');
-      setSyncStatus('Queued for background sync');
-      return;
-    } catch (e) {
-      // fall through to immediate sync
-    }
+    try { await reg.sync.register('sync-scans'); setSyncStatus('Queued for background sync'); return; } catch(_) {}
   }
-  // Otherwise, push now
   await pushNow();
 }
 
 async function pushNow() {
   const unsynced = await idbGetAll(true);
   if (!unsynced.length) { setSyncStatus('Nothing to sync'); return; }
-
   setSyncStatus(`Syncing ${unsynced.length}…`);
   try {
     const payload = unsynced.map(r => ({ id: r.id, sku: r.sku, count: r.count, timestamp: r.ts }));
-    const res = await fetch('/api/scan', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ scans: payload })
-    });
+    const res = await fetch('/api/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ scans: payload }) });
     if (!res.ok) throw new Error('Server error');
     const done = await res.json();
     await idbMarkSynced(done.synced_ids || []);
@@ -387,10 +321,7 @@ async function pushNow() {
 }
 
 document.getElementById('syncBtn').onclick = pushNow;
-document.getElementById('clearLocal').onclick = async () => {
-  await idbClearUnsynced();
-  refreshLocalAgg();
-};
+document.getElementById('clearLocal').onclick = async () => { await idbClearUnsynced(); refreshLocalAgg(); };
 document.getElementById('refreshServer').onclick = loadServer;
 
 async function loadServer() {
@@ -403,19 +334,19 @@ async function loadServer() {
       tr.innerHTML = `<td>${r.sku}</td><td>${r.count}</td><td>${r.timestamp}</td>`;
       serverTableBody.appendChild(tr);
     });
-  } catch(e) {
-    // ignore offline
-  }
+  } catch(e) {}
 }
 
 refreshLocalAgg();
 loadServer();
 
-// Ask for camera permission upfront to reveal labels on iOS
-navigator.mediaDevices?.getUserMedia({ video: true, audio: false }).then(s => {
-  s.getTracks().forEach(t => t.stop());
-  listCameras();
-}).catch(()=>listCameras());
+// SW→page message hook for background sync fallback
+navigator.serviceWorker?.addEventListener('message', (ev)=>{
+  if (ev.data?.action === 'push-now') pushNow();
+});
+
+// Try to list cameras on load
+ensurePermissionAndDeviceList();
 </script>
 </body>
 </html>
@@ -436,7 +367,6 @@ self.addEventListener('activate', event => {
 });
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
-  // network-first for API; cache-first for others
   if (url.pathname.startsWith('/api/')) {
     event.respondWith(fetch(event.request).catch(() => new Response(JSON.stringify([]), {headers:{'Content-Type':'application/json'}})));
   } else {
@@ -454,9 +384,6 @@ self.addEventListener('sync', event => {
     event.waitUntil(pushScans());
   }
 });
-
-// IndexedDB helpers inside SW (simplified, uses IDB via clients.postMessage fallback if needed)
-// Here, we'll just message the page to perform 'pushNow' since browsers limit IDB in SW on some platforms.
 async function pushScans(){
   const clientsArr = await self.clients.matchAll({ includeUncontrolled: true, type: 'window' });
   for (const c of clientsArr) {
@@ -476,11 +403,13 @@ MANIFEST_JSON = {
     "icons": []
 }
 
+
 @app.get("/")
 def index():
     resp = make_response(INDEX_HTML)
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
     return resp
+
 
 @app.get("/service-worker.js")
 def sw():
@@ -488,9 +417,11 @@ def sw():
     resp.headers["Content-Type"] = "application/javascript; charset=utf-8"
     return resp
 
+
 @app.get("/manifest.json")
 def manifest():
     return jsonify(MANIFEST_JSON)
+
 
 # ───────────────────────── API ─────────────────────────
 @app.post("/api/scan")
@@ -512,7 +443,7 @@ def api_scan():
             count = int(s.get("count", 1) or 1)
             ts_raw = s.get("timestamp")
             try:
-                ts = dt.datetime.fromisoformat(ts_raw.replace("Z","+00:00")) if isinstance(ts_raw, str) else dt.datetime.utcnow()
+                ts = dt.datetime.fromisoformat(ts_raw.replace("Z", "+00:00")) if isinstance(ts_raw, str) else dt.datetime.utcnow()
             except Exception:
                 ts = dt.datetime.utcnow()
             if not sku:
@@ -528,6 +459,7 @@ def api_scan():
     finally:
         session.close()
 
+
 @app.get("/api/scans")
 def api_scans():
     session = SessionLocal()
@@ -540,7 +472,7 @@ def api_scans():
     finally:
         session.close()
 
-# ───────────────────────── Run ─────────────────────────
+
+# ───────────────────────── Run (local dev) ─────────────────────────
 if __name__ == "__main__":
-    # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
