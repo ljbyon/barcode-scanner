@@ -1,8 +1,3 @@
-# requirements.txt
-flask==2.3.3
-gunicorn==21.2.0
-
-# app.py (your main Flask file - same as before)
 from flask import Flask, render_template_string, jsonify, request
 import json
 
