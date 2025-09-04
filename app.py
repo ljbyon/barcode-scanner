@@ -50,7 +50,7 @@ INDEX_HTML = """<!doctype html>
     main{padding:16px;max-width:980px;margin:0 auto}
     .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
     .card{background:#151922;border:1px solid #24293a;border-radius:14px;padding:14px}
-    video{width:100%;max-height:320px;background:#000;border-radius:10px}
+    video{width:100%;max-height:420px;background:#000;border-radius:10px}
     button{background:#2b6fff;border:none;color:white;padding:10px 14px;border-radius:10px;cursor:pointer}
     button.secondary{background:#2b2f3a}
     table{width:100%;border-collapse:collapse;margin-top:10px}
@@ -60,6 +60,10 @@ INDEX_HTML = """<!doctype html>
     input,select{background:#0f1115;border:1px solid #24293a;color:#e6e8eb;border-radius:10px;padding:8px}
     .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
     @media (max-width:720px){.grid{grid-template-columns:1fr}}
+    .ctrls{gap:8px}
+    .range{width:160px}
+    #overlay{position:relative}
+    #guide{position:absolute;inset:0;pointer-events:none;border:2px dashed rgba(255,255,255,.35);border-radius:10px;margin:10% 10%}
   </style>
 </head>
 <body>
@@ -71,20 +75,29 @@ INDEX_HTML = """<!doctype html>
   <div class="grid">
     <section class="card">
       <h3>Camera Scanner</h3>
-      <div class="row">
+      <div class="row ctrls">
         <select id="cameraSelect"></select>
+        <select id="resSelect" title="Resolution">
+          <option value="hd">HD 1280×720</option>
+          <option value="fhd" selected>FullHD 1920×1080</option>
+          <option value="uhd">UHD 2560×1440 (if supported)</option>
+        </select>
         <button id="startBtn">Start</button>
         <button id="stopBtn" class="secondary">Stop</button>
         <button id="flashBtn" class="secondary">Toggle Flash</button>
+        <label>Zoom <input id="zoomRange" class="range" type="range" min="1" max="1" step="0.1" value="1"></label>
       </div>
-      <video id="preview" autoplay muted playsinline></video>
+      <div id="overlay">
+        <video id="preview" autoplay muted playsinline></video>
+        <div id="guide"></div>
+      </div>
       <div style="margin-top:8px" id="lastScan">Last scan: —</div>
       <div style="margin-top:8px" class="row">
         <input id="manualSku" placeholder="Enter SKU manually"/>
         <button id="addManual">Add +1</button>
       </div>
       <p style="opacity:.8;margin-top:8px">
-        Tip: each scan increments the SKU’s count by 1. Use the manual field if a barcode is damaged.
+        Tip: aim the barcode inside the dashed box, keep ~15–30cm distance, and use zoom if needed.
       </p>
       <div class="row">
         <button id="syncBtn">Sync now</button>
@@ -129,8 +142,8 @@ function updateNet() {
   netStatus.textContent = navigator.onLine ? 'Online' : 'Offline';
   netStatus.className = 'pill ' + (navigator.onLine ? 'ok' : 'warn');
 }
-window.addEventListener('online', updateNet);
-window.addEventListener('offline', updateNet);
+addEventListener('online', updateNet);
+addEventListener('offline', updateNet);
 updateNet();
 
 /* ───────── UI elems ───────── */
@@ -139,9 +152,11 @@ const aggTableBody = document.querySelector('#aggTable tbody');
 const serverTableBody = document.querySelector('#serverTable tbody');
 const preview = document.getElementById('preview');
 const cameraSelect = document.getElementById('cameraSelect');
+const resSelect = document.getElementById('resSelect');
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const flashBtn = document.getElementById('flashBtn');
+const zoomRange = document.getElementById('zoomRange');
 const syncStatus = document.getElementById('syncStatus');
 function setSyncStatus(t) { syncStatus.textContent = t; }
 function setLast(msg){ lastScan.textContent = msg; }
@@ -175,6 +190,14 @@ let quaggaRunning = false;
 let currentStreamTrack = null;
 let plainStream = null;
 
+function wantedResolution() {
+  switch (resSelect.value) {
+    case 'uhd': return { width: {min:1280, ideal:2560, max:4096}, height: {min:720, ideal:1440, max:2160} };
+    case 'fhd': return { width: {min:1280, ideal:1920, max:2560}, height: {min:720, ideal:1080, max:1440} };
+    default:    return { width: {min:960,  ideal:1280, max:1920}, height: {min:540, ideal:720,  max:1080} };
+  }
+}
+
 async function ensurePermissionAndDeviceList() {
   try {
     const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
@@ -195,18 +218,45 @@ async function ensurePermissionAndDeviceList() {
   if (back) cameraSelect.value = back.deviceId;
 }
 
+async function applyProControls(track){
+  // Try to enable continuous focus/exposure/white-balance; ignore if unsupported
+  try {
+    const caps = track.getCapabilities?.() || {};
+    const cons = { advanced: [] };
+    if (caps.focusMode && caps.focusMode.includes('continuous'))  cons.advanced.push({ focusMode: 'continuous' });
+    if (caps.exposureMode && caps.exposureMode.includes('continuous')) cons.advanced.push({ exposureMode: 'continuous' });
+    if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('continuous')) cons.advanced.push({ whiteBalanceMode: 'continuous' });
+    if (cons.advanced.length) await track.applyConstraints(cons);
+    // Setup zoom slider if available
+    if (caps.zoom) {
+      zoomRange.min = caps.zoom.min || 1;
+      zoomRange.max = caps.zoom.max || 1;
+      zoomRange.step = caps.zoom.step || 0.1;
+      zoomRange.value = caps.zoom.min || 1;
+      zoomRange.oninput = async () => {
+        try { await track.applyConstraints({ advanced: [{ zoom: Number(zoomRange.value) }] }); } catch(_){}
+      };
+    } else {
+      zoomRange.disabled = true;
+    }
+  } catch(e) { /* ignore */ }
+}
+
 async function startScanner() {
   stopScanner(); // clean previous
   await ensurePermissionAndDeviceList();
 
   const deviceId = cameraSelect.value || undefined;
+  const res = wantedResolution();
   const constraints = deviceId
-    ? { video: { deviceId: { exact: deviceId } }, audio: false }
-    : { video: { facingMode: { ideal: 'environment' } }, audio: false };
+    ? { video: { deviceId: { exact: deviceId }, ...res, facingMode: { ideal: 'environment' } }, audio: false }
+    : { video: { ...res, facingMode: { ideal: 'environment' } }, audio: false };
 
-  // Plain preview first (so you can see camera even if Quagga fails)
+  // Plain preview first
   try {
     plainStream = await navigator.mediaDevices.getUserMedia(constraints);
+    const track = plainStream.getVideoTracks()[0];
+    await applyProControls(track);
     preview.srcObject = plainStream;
     await preview.play();
   } catch (e) {
@@ -215,13 +265,16 @@ async function startScanner() {
     return;
   }
 
-  const qConstraints = { ...constraints.video, width: { ideal: 1280 }, height: { ideal: 720 } };
-
+  // Quagga with tuned params: larger patch, no halfSample, analyze center box
+  const qConstraints = { ...constraints.video };
   Quagga.init({
     inputStream: {
       type: "LiveStream",
       target: preview,
-      constraints: qConstraints
+      constraints: qConstraints,
+      area: { // scan only the center region (matches dashed guide)
+        top: "10%", right: "10%", left: "10%", bottom: "10%"
+      }
     },
     decoder: {
       readers: [
@@ -230,8 +283,8 @@ async function startScanner() {
       ]
     },
     locate: true,
-    numOfWorkers: 0,            // mobile quirk
-    locator: { patchSize: "medium", halfSample: true }
+    numOfWorkers: 0,                  // mobile quirk
+    locator: { patchSize: "x-large", halfSample: false }
   }, (err) => {
     if (err) {
       console.error(err);
@@ -241,7 +294,7 @@ async function startScanner() {
     Quagga.start();
     quaggaRunning = true;
     try { currentStreamTrack = Quagga.cameraAccess.getActiveTrack(); } catch(_) {}
-    setLast('Scanner started. Point a barcode at the camera.');
+    setLast('Scanner started. Point a barcode at the center box.');
   });
 
   Quagga.onDetected(async (data) => {
