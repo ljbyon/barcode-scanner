@@ -285,6 +285,41 @@ HTML_TEMPLATE = '''
         setInterval(checkConnection, 5000);
         checkConnection();
         
+        // Add tap-to-focus functionality
+        document.getElementById('interactive').addEventListener('click', function(e) {
+            if (isScanning) {
+                // Visual feedback for tap
+                const ripple = document.createElement('div');
+                ripple.style.position = 'absolute';
+                ripple.style.left = e.offsetX + 'px';
+                ripple.style.top = e.offsetY + 'px';
+                ripple.style.width = '20px';
+                ripple.style.height = '20px';
+                ripple.style.background = 'rgba(0, 123, 255, 0.5)';
+                ripple.style.borderRadius = '50%';
+                ripple.style.transform = 'translate(-50%, -50%)';
+                ripple.style.pointerEvents = 'none';
+                e.target.appendChild(ripple);
+                
+                setTimeout(() => ripple.remove(), 1000);
+                
+                // Try to trigger autofocus (limited browser support)
+                const video = document.querySelector('#interactive video');
+                if (video && video.srcObject) {
+                    const track = video.srcObject.getVideoTracks()[0];
+                    if (track && track.applyConstraints) {
+                        track.applyConstraints({
+                            focusMode: 'single-shot'
+                        }).then(() => {
+                            console.log('Focus triggered');
+                        }).catch(err => {
+                            console.log('Focus not supported');
+                        });
+                    }
+                }
+            }
+        });
+        
         // Load history on page load
         loadHistory();
     </script>
